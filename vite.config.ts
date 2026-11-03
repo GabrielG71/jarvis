@@ -1,15 +1,9 @@
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
-import { spawn } from 'node:child_process'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import { JARVIS_PROMPT } from './server/jarvis-prompt.ts'
+import { aquecer, matarTodas, Ocupado, perguntar, UUID } from './server/claude-pool.ts'
 
-const ROOT = dirname(fileURLToPath(import.meta.url))
 const MAX_BODY = 8 * 1024
-const TIMEOUT_MS = 120_000
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 function send(res: ServerResponse, status: number, body: unknown) {
   res.statusCode = status
@@ -44,74 +38,108 @@ function readBody(req: IncomingMessage): Promise<string> {
   })
 }
 
-function runClaude(message: string, sessionId?: string): Promise<{ text: string; sessionId: string }> {
-  // sem shell: array de args. Só ferramentas do ClickUp liberadas.
-  // `--` antes da mensagem: --allowedTools é variadico e a mensagem pode começar com "-".
-  const args = [
-    '-p',
-    '--output-format', 'json',
-    '--model', 'sonnet',
-    '--append-system-prompt', JARVIS_PROMPT,
-    '--allowedTools', 'mcp__clickup__*',
-  ]
-  if (sessionId) args.push('--resume', sessionId)
-  args.push('--', message)
+// Data/hora local que a página manda junto: só letras, números e pontuação de data, curto.
+const AGORA = /^[\p{L}\p{N} :+\-/,.()|_]{1,120}$/u
 
-  return new Promise((resolve, reject) => {
-    const child = spawn('claude', args, { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] })
-    let out = ''
-    let err = ''
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL')
-      reject(new Error('o Claude demorou demais para responder'))
-    }, TIMEOUT_MS)
-    child.stdout.on('data', (d) => (out += d))
-    child.stderr.on('data', (d) => (err += d))
-    child.on('error', (e) => {
-      clearTimeout(timer)
-      reject(e)
-    })
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      try {
-        const j = JSON.parse(out)
-        if (j.is_error || typeof j.result !== 'string') {
-          return reject(new Error(typeof j.result === 'string' ? j.result : 'resposta inválida do Claude'))
-        }
-        resolve({ text: j.result, sessionId: j.session_id })
-      } catch {
-        reject(new Error(`claude saiu com código ${code}: ${(err || out).slice(0, 300)}`))
-      }
-    })
-  })
+function jsonBody(raw: string): Record<string, unknown> {
+  if (!raw.trim()) return {}
+  const b = JSON.parse(raw)
+  if (!b || typeof b !== 'object' || Array.isArray(b)) throw new SyntaxError('JSON inválido')
+  return b
+}
+
+// conversationId opcional: UUID gerado pelo servidor. Devolve undefined se ausente e lança se inválido.
+class Invalido extends Error {}
+function lerConversa(v: unknown): string | undefined {
+  if (v == null || v === '') return undefined
+  if (typeof v !== 'string' || !UUID.test(v)) throw new Invalido('conversationId inválido')
+  return v
 }
 
 function jarvisApi(): Plugin {
   return {
     name: 'jarvis-api',
     configureServer(server) {
-      server.middlewares.use('/api/chat', async (req, res) => {
+      // nenhum processo `claude` sobrevive ao servidor
+      server.httpServer?.once('close', matarTodas)
+      process.once('exit', matarTodas)
+
+      // aquece um processo (CLI + MCP do ClickUp) enquanto a página carrega
+      server.middlewares.use('/api/warm', async (req, res) => {
         if (req.method !== 'POST') return send(res, 405, { error: 'use POST' })
         try {
-          const body = JSON.parse(await readBody(req))
+          const body = jsonBody(await readBody(req))
+          send(res, 200, { conversationId: aquecer(lerConversa(body.conversationId)) })
+        } catch (e) {
+          erroJson(res, e)
+        }
+      })
+
+      // resposta em NDJSON: {conversationId} no começo, {delta} conforme o texto chega, depois
+      // {done, conversationId} — ou {error}
+      server.middlewares.use('/api/chat', async (req, res) => {
+        if (req.method !== 'POST') return send(res, 405, { error: 'use POST' })
+        let conversationId: string | undefined
+        try {
+          const body = jsonBody(await readBody(req))
           const message = typeof body.message === 'string' ? body.message.trim() : ''
           if (!message) return send(res, 400, { error: 'message obrigatória' })
-          let sessionId: string | undefined
-          if (body.sessionId != null && body.sessionId !== '') {
-            if (typeof body.sessionId !== 'string' || !UUID.test(body.sessionId)) {
-              return send(res, 400, { error: 'sessionId inválido' })
-            }
-            sessionId = body.sessionId
+          conversationId = lerConversa(body.conversationId)
+          let agora = new Date().toString() // sem o campo (curl), vale o relógio desta máquina
+          if (body.agora != null && body.agora !== '') {
+            if (typeof body.agora !== 'string' || !AGORA.test(body.agora)) return send(res, 400, { error: 'agora inválido' })
+            agora = body.agora
           }
-          send(res, 200, await runClaude(message, sessionId))
+
+          const linha = (o: unknown) => {
+            if (res.writableEnded) return
+            if (!res.headersSent) {
+              res.statusCode = 200
+              res.setHeader('content-type', 'application/x-ndjson; charset=utf-8')
+              res.setHeader('cache-control', 'no-cache, no-transform')
+              res.setHeader('x-accel-buffering', 'no')
+              res.flushHeaders()
+            }
+            res.write(JSON.stringify(o) + '\n')
+          }
+          // cliente que fechou/abortou: interrompe a resposta em andamento
+          const ac = new AbortController()
+          res.on('close', () => {
+            if (!res.writableFinished) ac.abort()
+          })
+
+          let id = conversationId ?? ''
+          try {
+            await perguntar(
+              conversationId,
+              `[agora: ${agora}] ${message}`,
+              (delta) => linha({ delta }),
+              (novo) => {
+                id = novo
+                linha({ conversationId: id })
+              },
+              ac.signal,
+            )
+            linha({ done: true, conversationId: id })
+          } catch (e) {
+            if (e instanceof Ocupado && !res.headersSent) return send(res, 503, { error: e.message })
+            linha({ error: e instanceof Error ? e.message : String(e) })
+          }
+          res.end()
         } catch (e) {
-          if (e instanceof BodyGrande) return send(res, 413, { error: e.message })
-          if (e instanceof SyntaxError) return send(res, 400, { error: 'JSON inválido' })
-          send(res, 500, { error: e instanceof Error ? e.message : String(e) })
+          erroJson(res, e)
         }
       })
     },
   }
+}
+
+function erroJson(res: ServerResponse, e: unknown) {
+  if (e instanceof BodyGrande) return send(res, 413, { error: e.message })
+  if (e instanceof SyntaxError) return send(res, 400, { error: 'JSON inválido' })
+  if (e instanceof Invalido) return send(res, 400, { error: e.message })
+  if (e instanceof Ocupado) return send(res, 503, { error: e.message })
+  send(res, 500, { error: e instanceof Error ? e.message : String(e) })
 }
 
 export default defineConfig({

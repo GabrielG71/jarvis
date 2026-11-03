@@ -18,3 +18,4 @@ Abra http://127.0.0.1:5173 no **Chrome**, clique no orbe (ou segure Espaço) e f
 - **Microfone:** permita quando o Chrome pedir.
 - O Chrome pode exigir um clique na primeira vez para liberar o som (política de autoplay); o primeiro clique ou tecla na página já basta.
 - O servidor fica preso em 127.0.0.1 porque `/api/chat` executa o `claude` — não exponha na rede.
+- **Velocidade:** o servidor mantém um processo `claude` vivo por conversa (até 3, encerrados após 15 min parados) e aquece um quando a página abre, então o ClickUp já está conectado na primeira pergunta. A resposta chega em streaming (NDJSON em `/api/chat`) e é falada frase a frase. A página manda a data/hora local junto, para o Jarvis não precisar consultar o ClickUp só para saber o dia.

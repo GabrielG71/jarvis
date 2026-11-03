@@ -3,7 +3,7 @@ import Orb, { type OrbState } from './Orb'
 
 const MUSICA = '/back-in-black.mp3'
 const SAUDACAO = 'Às suas ordens, senhor.'
-const SESSION_KEY = 'jarvis-session'
+const CONVERSA_KEY = 'jarvis-conversa'
 const VOLUME_MUSICA = 0.35
 const INTRO_MS = 20_000 // só a introdução do riff; depois some em fade
 
@@ -22,17 +22,17 @@ interface Reconhecedor {
 const SR: (new () => Reconhecedor) | undefined =
   (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
 
-function lerSessao(): string | null {
+function lerConversa(): string | null {
   try {
-    return sessionStorage.getItem(SESSION_KEY)
+    return sessionStorage.getItem(CONVERSA_KEY)
   } catch {
     return null
   }
 }
-function gravarSessao(id: string | null) {
+function gravarConversa(id: string | null) {
   try {
-    if (id) sessionStorage.setItem(SESSION_KEY, id)
-    else sessionStorage.removeItem(SESSION_KEY)
+    if (id) sessionStorage.setItem(CONVERSA_KEY, id)
+    else sessionStorage.removeItem(CONVERSA_KEY)
   } catch {
     /* sem storage: a conversa só dura enquanto a página estiver aberta */
   }
@@ -63,6 +63,17 @@ function escolherVoz(vozes: SpeechSynthesisVoice[]) {
   )
 }
 
+// data/hora local e fuso, para o Jarvis interpretar "hoje"/"amanhã" sem consultar o ClickUp
+function agoraLocal() {
+  const d = new Date()
+  const fuso = Intl.DateTimeFormat().resolvedOptions().timeZone
+  const dia = d.toLocaleDateString('pt-BR', { weekday: 'long' })
+  return `${dia}, ${d.toString().replace(/\s*\(.*\)$/, '')} | ${fuso}`.slice(0, 120)
+}
+
+// separa a próxima frase completa: pontuação final seguida de espaço, ou quebra de linha
+const FIM_DE_FRASE = /[.!?…]+["')»]*\s|\n/
+
 const emCampoDeTexto = (e: Event) => (e.target as Element | null)?.tagName === 'INPUT'
 
 export default function App() {
@@ -72,7 +83,18 @@ export default function App() {
   const [digitado, setDigitado] = useState('')
 
   const estadoRef = useRef<OrbState>('idle')
-  const sessionRef = useRef<string | null>(lerSessao())
+  const conversaRef = useRef<string | null>(lerConversa())
+  const vozRef = useRef<SpeechSynthesisVoice | undefined>(undefined)
+
+  // --- resposta em streaming: fala por frase ---
+  const abortRef = useRef<AbortController | null>(null)
+  const geracaoRef = useRef(0) // invalida callbacks de falas canceladas
+  const pendentesRef = useRef(0) // frases enfileiradas e ainda não faladas
+  const streamAtivoRef = useRef(false)
+  const bufferRef = useRef('') // texto recebido que ainda não fechou uma frase
+  const textoRef = useRef('') // resposta inteira até agora (transcrição)
+  const falouRef = useRef(false)
+  const aquecidoEmRef = useRef(0)
   const recRef = useRef<Reconhecedor | null>(null)
 
   // --- música ---
@@ -167,36 +189,152 @@ export default function App() {
     falar(SAUDACAO, { manterMusica: true, aoRecusar: () => (saudouRef.current = false) })
   }, [falar])
 
+  // --- fala por frase ---
+  const enfileirar = useCallback(
+    (frase: string) => {
+      const synth = window.speechSynthesis
+      if (!synth) return
+      const geracao = geracaoRef.current
+      const u = new SpeechSynthesisUtterance(frase)
+      u.lang = 'pt-BR'
+      u.rate = 1.05
+      if (vozRef.current) u.voice = vozRef.current
+      const terminou = () => {
+        if (geracao !== geracaoRef.current) return
+        if (--pendentesRef.current > 0) return
+        // fila vazia: ou a resposta acabou, ou falta chegar a próxima frase
+        if (streamAtivoRef.current) mudarEstado('thinking')
+        else if (estadoRef.current === 'speaking') mudarEstado('idle')
+      }
+      u.onstart = () => {
+        if (geracao !== geracaoRef.current) return
+        fadeOutMusica()
+        mudarEstado('speaking')
+      }
+      u.onboundary = () => (picoRef.current = 1)
+      u.onend = terminou
+      u.onerror = terminou
+      pendentesRef.current++
+      falouRef.current = true
+      synth.speak(u)
+    },
+    [fadeOutMusica, mudarEstado],
+  )
+
+  // acumula o texto e fala cada frase completa; `fim` descarrega o que sobrou
+  const alimentar = useCallback(
+    (delta: string, fim = false) => {
+      textoRef.current += delta
+      setResposta(textoRef.current)
+      bufferRef.current += delta
+      for (let m = FIM_DE_FRASE.exec(bufferRef.current); m; m = FIM_DE_FRASE.exec(bufferRef.current)) {
+        const corte = m.index + m[0].length
+        const frase = bufferRef.current.slice(0, corte).trim()
+        bufferRef.current = bufferRef.current.slice(corte)
+        if (frase) enfileirar(frase)
+      }
+      if (fim && bufferRef.current.trim()) enfileirar(bufferRef.current.trim())
+      if (fim) bufferRef.current = ''
+    },
+    [enfileirar],
+  )
+
+  // nova pergunta (ou nova escuta): aborta a resposta em andamento e limpa a fila de fala
+  const cancelarResposta = useCallback(() => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    streamAtivoRef.current = false
+    geracaoRef.current++
+    pendentesRef.current = 0
+    bufferRef.current = ''
+    window.speechSynthesis?.cancel()
+  }, [])
+
+  // pré-aquece o processo do Claude (CLI + ClickUp) no servidor; é barato se já estiver vivo
+  const aquecer = useCallback(() => {
+    const agora = Date.now()
+    if (agora - aquecidoEmRef.current < 30_000) return
+    aquecidoEmRef.current = agora
+    fetch('/api/warm', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ conversationId: conversaRef.current ?? undefined }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        if (j && typeof j.conversationId === 'string') {
+          conversaRef.current = j.conversationId
+          gravarConversa(j.conversationId)
+        }
+      })
+      .catch(() => {
+        aquecidoEmRef.current = 0
+      })
+  }, [])
+
   // --- envio ao Claude ---
   const enviar = useCallback(
     async (texto: string) => {
+      cancelarResposta()
+      const ac = new AbortController()
+      abortRef.current = ac
+      streamAtivoRef.current = true
+      textoRef.current = ''
+      falouRef.current = false
       mudarEstado('thinking')
       setResposta('')
       try {
         const r = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ message: texto, sessionId: sessionRef.current ?? undefined }),
+          body: JSON.stringify({ message: texto, conversationId: conversaRef.current ?? undefined, agora: agoraLocal() }),
+          signal: ac.signal,
         })
-        const j = await r.json()
-        if (!r.ok || typeof j.text !== 'string') throw new Error(j.error ?? `HTTP ${r.status}`)
-        if (j.sessionId) {
-          sessionRef.current = j.sessionId
-          gravarSessao(j.sessionId)
+        if (!r.ok || !r.body) throw new Error((await r.json().catch(() => null))?.error ?? `HTTP ${r.status}`)
+        // NDJSON: {conversationId} | {delta} | {done} | {error}
+        const leitor = r.body.getReader()
+        const decoder = new TextDecoder()
+        let resto = ''
+        let terminou = false
+        const tratar = (linha: string) => {
+          if (!linha.trim()) return
+          const ev = JSON.parse(linha)
+          if (typeof ev.conversationId === 'string') {
+            conversaRef.current = ev.conversationId
+            gravarConversa(ev.conversationId)
+          }
+          if (typeof ev.delta === 'string') alimentar(ev.delta)
+          if (ev.error) throw new Error(String(ev.error))
+          if (ev.done) terminou = true
         }
-        setResposta(j.text)
-        falar(j.text)
+        for (;;) {
+          const { value, done } = await leitor.read()
+          if (done) break
+          resto += decoder.decode(value, { stream: true })
+          const linhas = resto.split('\n')
+          resto = linhas.pop() ?? ''
+          linhas.forEach(tratar)
+        }
+        tratar(resto)
+        if (!terminou) throw new Error('resposta interrompida')
+        alimentar('', true)
+        streamAtivoRef.current = false
+        if (!falouRef.current) mudarEstado('idle') // resposta vazia
+        else if (pendentesRef.current === 0 && estadoRef.current !== 'speaking') mudarEstado('idle')
       } catch (e) {
-        // sessão velha/inválida travaria todas as próximas perguntas: recomeça do zero
-        sessionRef.current = null
-        gravarSessao(null)
+        if (ac.signal.aborted) return // nova pergunta: quem cancelou já cuida do estado
+        // conversa velha/inválida travaria todas as próximas perguntas: recomeça do zero
+        conversaRef.current = null
+        gravarConversa(null)
         console.error('jarvis:', e)
+        streamAtivoRef.current = false
         const msg = 'Perdão, senhor, não consegui concluir o pedido.'
-        setResposta(msg)
-        falar(msg)
+        textoRef.current += (textoRef.current ? '\n' : '') + msg
+        setResposta(textoRef.current)
+        enfileirar(msg)
       }
     },
-    [falar, mudarEstado],
+    [alimentar, cancelarResposta, enfileirar, mudarEstado],
   )
 
   // pergunta digitada: mesmo fluxo da fala
@@ -205,10 +343,10 @@ export default function App() {
     if (!texto || estadoRef.current === 'thinking' || estadoRef.current === 'listening') return
     setDigitado('')
     setOuvido(texto)
-    window.speechSynthesis?.cancel()
+    cancelarResposta()
     fadeOutMusica()
     void enviar(texto)
-  }, [digitado, enviar, fadeOutMusica])
+  }, [cancelarResposta, digitado, enviar, fadeOutMusica])
 
   // --- escuta ---
   const pararMic = useCallback(() => {
@@ -241,8 +379,9 @@ export default function App() {
       setResposta('Este navegador não tem reconhecimento de voz. Use o Chrome.')
       return
     }
-    window.speechSynthesis?.cancel()
+    cancelarResposta()
     fadeOutMusica()
+    aquecer() // enquanto ele fala, o Claude já sobe
 
     const rec = new SR()
     rec.lang = 'pt-BR'
@@ -284,7 +423,7 @@ export default function App() {
       recRef.current = null
       mudarEstado('idle')
     }
-  }, [abrirMic, enviar, fadeOutMusica, mudarEstado, pararMic])
+  }, [abrirMic, aquecer, cancelarResposta, enviar, fadeOutMusica, mudarEstado, pararMic])
 
   // Espaço: segurar = escutar, soltar = fim da frase
   useEffect(() => {
@@ -306,6 +445,23 @@ export default function App() {
       window.removeEventListener('keyup', up)
     }
   }, [alternarEscuta])
+
+  // voz escolhida uma vez; Claude aquecido ao abrir e sempre que a página volta ao foco
+  // (o servidor encerra o processo depois de 15 min parado)
+  useEffect(() => {
+    if (window.speechSynthesis) void vozesProntas().then((v) => (vozRef.current = escolherVoz(v)))
+    aquecer()
+    const volta = () => {
+      if (document.visibilityState === 'visible') aquecer()
+    }
+    document.addEventListener('visibilitychange', volta)
+    window.addEventListener('focus', volta)
+    return () => {
+      document.removeEventListener('visibilitychange', volta)
+      window.removeEventListener('focus', volta)
+      abortRef.current?.abort()
+    }
+  }, [aquecer])
 
   // música ao abrir a página + saudação; se o autoplay for barrado, vale o primeiro gesto
   useEffect(() => {
