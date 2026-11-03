@@ -9,7 +9,9 @@ npm i
 npm run dev
 ```
 
-Abra http://127.0.0.1:5173 no **Chrome**, clique no orbe (ou segure Espaço) e fale.
+Abra http://127.0.0.1:5173 no **Chrome**, clique no orbe (ou segure Espaço) e fale — ou digite a pergunta na caixa abaixo do orbe e dê Enter. A resposta é falada e o texto aparece embaixo.
+
+**Instalar como app:** no Chrome, clique no ícone de instalar na barra de endereço (ou menu ⋮ → Instalar Jarvis). O servidor (`npm run dev`) precisa estar rodando.
 
 - **Pré-requisito:** o CLI `claude` logado e com o MCP do ClickUp conectado.
 - **Música:** ponha o seu arquivo em `public/back-in-black.mp3` (fica fora do git, direito autoral). Sem o arquivo, o Jarvis só não toca nada.

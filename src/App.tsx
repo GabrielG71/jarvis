@@ -4,6 +4,7 @@ import Orb, { type OrbState } from './Orb'
 const MUSICA = '/back-in-black.mp3'
 const SAUDACAO = 'Às suas ordens, senhor.'
 const SESSION_KEY = 'jarvis-session'
+const VOLUME_MUSICA = 0.35
 
 // --- Web Speech: tipos mínimos (não vêm no lib.dom) ---
 interface Reconhecedor {
@@ -61,10 +62,13 @@ function escolherVoz(vozes: SpeechSynthesisVoice[]) {
   )
 }
 
+const emCampoDeTexto = (e: Event) => (e.target as Element | null)?.tagName === 'INPUT'
+
 export default function App() {
   const [estado, setEstado] = useState<OrbState>('idle')
   const [ouvido, setOuvido] = useState('')
   const [resposta, setResposta] = useState('')
+  const [digitado, setDigitado] = useState('')
 
   const estadoRef = useRef<OrbState>('idle')
   const sessionRef = useRef<string | null>(lerSessao())
@@ -166,6 +170,7 @@ export default function App() {
   const enviar = useCallback(
     async (texto: string) => {
       mudarEstado('thinking')
+      setResposta('')
       try {
         const r = await fetch('/api/chat', {
           method: 'POST',
@@ -192,6 +197,17 @@ export default function App() {
     },
     [falar, mudarEstado],
   )
+
+  // pergunta digitada: mesmo fluxo da fala
+  const enviarDigitado = useCallback(() => {
+    const texto = digitado.trim()
+    if (!texto || estadoRef.current === 'thinking' || estadoRef.current === 'listening') return
+    setDigitado('')
+    setOuvido(texto)
+    window.speechSynthesis?.cancel()
+    fadeOutMusica()
+    void enviar(texto)
+  }, [digitado, enviar, fadeOutMusica])
 
   // --- escuta ---
   const pararMic = useCallback(() => {
@@ -272,13 +288,13 @@ export default function App() {
   // Espaço: segurar = escutar, soltar = fim da frase
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
-      if (e.code !== 'Space') return
+      if (e.code !== 'Space' || emCampoDeTexto(e)) return
       e.preventDefault()
       if (e.repeat) return
       if (estadoRef.current === 'idle' || estadoRef.current === 'speaking') alternarEscuta()
     }
     const up = (e: KeyboardEvent) => {
-      if (e.code !== 'Space') return
+      if (e.code !== 'Space' || emCampoDeTexto(e)) return
       e.preventDefault()
       if (estadoRef.current === 'listening') recRef.current?.stop()
     }
@@ -294,6 +310,7 @@ export default function App() {
   useEffect(() => {
     const audio = new Audio(MUSICA)
     audio.loop = true
+    audio.volume = VOLUME_MUSICA
     audioRef.current = audio
 
     const tocar = () => {
@@ -315,7 +332,7 @@ export default function App() {
 
     const gesto = (e: Event) => {
       const noOrbe = (e.target as Element | null)?.closest?.('.orb')
-      const espaco = e instanceof KeyboardEvent && e.code === 'Space'
+      const espaco = e instanceof KeyboardEvent && e.code === 'Space' && !emCampoDeTexto(e)
       // gesto que já inicia a escuta não deve acender a música
       if (noOrbe || espaco) saudouRef.current = true // vai escutar: sem saudação
       else {
@@ -341,11 +358,28 @@ export default function App() {
   return (
     <div className="stage">
       <Orb state={estado} getLevel={getLevel} onClick={alternarEscuta} />
+      <form
+        className="entrada"
+        onSubmit={(e) => {
+          e.preventDefault()
+          enviarDigitado()
+        }}
+      >
+        <input
+          value={digitado}
+          onChange={(e) => setDigitado(e.target.value)}
+          disabled={estado === 'thinking'}
+          placeholder="ou digite sua pergunta…"
+          aria-label="Pergunta ao Jarvis"
+          autoComplete="off"
+          enterKeyHint="send"
+        />
+      </form>
       <div className="legenda" aria-live="polite">
         {ouvido && <div className="voce">{ouvido}</div>}
         {resposta && <div className="jarvis">{resposta}</div>}
       </div>
-      <div className="dica">clique no orbe ou segure Espaço</div>
+      <div className="dica">clique no orbe ou segure Espaço · ou digite</div>
     </div>
   )
 }
