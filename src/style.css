@@ -1,0 +1,60 @@
+:root {
+  color-scheme: dark;
+  --ciano: #36e0ff;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  margin: 0;
+  height: 100%;
+  background: radial-gradient(ellipse at center, #07121c 0%, #02050a 70%);
+  color: #cfeaf5;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  overflow: hidden;
+}
+
+.stage {
+  position: relative;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.orb {
+  width: min(70vmin, 520px);
+  height: min(70vmin, 520px);
+  cursor: pointer;
+  outline: none;
+  border-radius: 50%;
+}
+
+.legenda {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 8vh;
+  padding: 0 24px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 15px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.legenda .voce { color: #7fa6b6; }
+.legenda .jarvis { color: var(--ciano); text-shadow: 0 0 12px rgba(54, 224, 255, 0.4); }
+
+.dica {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 3vh;
+  text-align: center;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: #3f5f6e;
+  pointer-events: none;
+}

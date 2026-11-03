@@ -1,0 +1,6 @@
+node_modules
+dist
+*.log
+.env*
+# música com direito autoral não vai pro git
+public/*.mp3
