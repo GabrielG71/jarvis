@@ -5,6 +5,7 @@ const MUSICA = '/back-in-black.mp3'
 const SAUDACAO = 'Às suas ordens, senhor.'
 const SESSION_KEY = 'jarvis-session'
 const VOLUME_MUSICA = 0.35
+const INTRO_MS = 20_000 // só a introdução do riff; depois some em fade
 
 // --- Web Speech: tipos mínimos (não vêm no lib.dom) ---
 interface Reconhecedor {
@@ -309,7 +310,8 @@ export default function App() {
   // música ao abrir a página + saudação; se o autoplay for barrado, vale o primeiro gesto
   useEffect(() => {
     const audio = new Audio(MUSICA)
-    audio.loop = true
+    audio.loop = false
+    let introTimer = 0
     audio.volume = VOLUME_MUSICA
     audioRef.current = audio
 
@@ -320,6 +322,7 @@ export default function App() {
           // o Jarvis já pode ter começado a ouvir/falar enquanto o play() resolvia
           if (musicaRef.current !== 'espera') return audio.pause()
           musicaRef.current = 'tocando'
+          introTimer = window.setTimeout(fadeOutMusica, INTRO_MS)
           saudar()
         },
         (e: DOMException) => {
@@ -346,6 +349,7 @@ export default function App() {
     return () => {
       window.removeEventListener('pointerdown', gesto)
       window.removeEventListener('keydown', gesto)
+      clearTimeout(introTimer)
       clearInterval(fadeRef.current)
       audio.pause()
       audioRef.current = null
@@ -353,7 +357,7 @@ export default function App() {
       pararMic()
       window.speechSynthesis?.cancel()
     }
-  }, [pararMic, saudar])
+  }, [fadeOutMusica, pararMic, saudar])
 
   return (
     <div className="stage">
