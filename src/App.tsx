@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Orb, { type OrbState } from './Orb'
+import { Fala } from './fala'
 
 const MUSICA = '/back-in-black.mp3'
 const SAUDACAO = 'Às suas ordens, senhor.'
@@ -38,31 +39,6 @@ function gravarConversa(id: string | null) {
   }
 }
 
-// espera as vozes do navegador carregarem (voiceschanged), com teto de 1,5 s
-function vozesProntas(): Promise<SpeechSynthesisVoice[]> {
-  const synth = window.speechSynthesis
-  const ja = synth.getVoices()
-  if (ja.length) return Promise.resolve(ja)
-  return new Promise((resolve) => {
-    const fim = () => {
-      synth.removeEventListener('voiceschanged', fim)
-      clearTimeout(t)
-      resolve(synth.getVoices())
-    }
-    const t = setTimeout(fim, 1500)
-    synth.addEventListener('voiceschanged', fim)
-  })
-}
-
-function escolherVoz(vozes: SpeechSynthesisVoice[]) {
-  const br = (v: SpeechSynthesisVoice) => v.lang.replace('_', '-').toLowerCase() === 'pt-br'
-  return (
-    vozes.find((v) => br(v) && v.name.includes('Google')) ??
-    vozes.find(br) ??
-    vozes.find((v) => v.lang.toLowerCase().startsWith('pt'))
-  )
-}
-
 // data/hora local e fuso, para o Jarvis interpretar "hoje"/"amanhã" sem consultar o ClickUp
 function agoraLocal() {
   const d = new Date()
@@ -84,7 +60,8 @@ export default function App() {
 
   const estadoRef = useRef<OrbState>('idle')
   const conversaRef = useRef<string | null>(lerConversa())
-  const vozRef = useRef<SpeechSynthesisVoice | undefined>(undefined)
+  const falaRef = useRef<Fala | null>(null)
+  if (!falaRef.current) falaRef.current = new Fala()
 
   // --- resposta em streaming: fala por frase ---
   const abortRef = useRef<AbortController | null>(null)
@@ -125,8 +102,8 @@ export default function App() {
       return 0.5 + 0.5 * Math.sin(t * 4) // sem microfone: anel pulsando
     }
     if (estadoRef.current === 'speaking') {
-      // o áudio do TTS não é analisável: ruído suave + picos nas fronteiras de palavra
-      picoRef.current *= 0.93
+      // ruído suave como base + nível real do áudio que está tocando
+      picoRef.current = Math.max(picoRef.current * 0.93, falaRef.current?.nivel() ?? 0)
       const ruido = 0.35 + 0.2 * Math.sin(t * 9) * Math.sin(t * 5.3) + 0.1 * Math.sin(t * 17.1)
       return Math.min(1, Math.max(ruido, picoRef.current))
     }
@@ -155,29 +132,19 @@ export default function App() {
   // --- fala ---
   const falar = useCallback(
     async (texto: string, opcoes: { manterMusica?: boolean; aoRecusar?: () => void } = {}) => {
-      const synth = window.speechSynthesis
-      if (!synth) return
-      synth.cancel()
-      const vozes = await vozesProntas()
-      const u = new SpeechSynthesisUtterance(texto)
-      u.lang = 'pt-BR'
-      u.rate = 1.05
-      const voz = escolherVoz(vozes)
-      if (voz) u.voice = voz
-      u.onstart = () => {
-        if (!opcoes.manterMusica) fadeOutMusica()
-        mudarEstado('speaking')
-      }
-      u.onboundary = () => (picoRef.current = 1)
-      u.onend = () => {
-        if (estadoRef.current === 'speaking') mudarEstado('idle')
-      }
-      u.onerror = (e) => {
-        if (estadoRef.current === 'speaking') mudarEstado('idle')
-        // sem gesto do usuário o Chrome recusa a fala: quem chamou tenta de novo depois
-        if (e.error === 'not-allowed') opcoes.aoRecusar?.()
-      }
-      synth.speak(u)
+      const fala = falaRef.current!
+      fala.cancelar()
+      fala.falar(texto, {
+        aoComecar: () => {
+          if (!opcoes.manterMusica) fadeOutMusica()
+          mudarEstado('speaking')
+        },
+        aoTerminar: () => {
+          if (estadoRef.current === 'speaking') mudarEstado('idle')
+        },
+        // sem gesto do usuário o Chrome recusa o áudio: quem chamou tenta de novo depois
+        aoRecusar: () => opcoes.aoRecusar?.(),
+      })
     },
     [fadeOutMusica, mudarEstado],
   )
@@ -192,31 +159,28 @@ export default function App() {
   // --- fala por frase ---
   const enfileirar = useCallback(
     (frase: string) => {
-      const synth = window.speechSynthesis
-      if (!synth) return
       const geracao = geracaoRef.current
-      const u = new SpeechSynthesisUtterance(frase)
-      u.lang = 'pt-BR'
-      u.rate = 1.05
-      if (vozRef.current) u.voice = vozRef.current
-      const terminou = () => {
-        if (geracao !== geracaoRef.current) return
-        if (--pendentesRef.current > 0) return
-        // fila vazia: ou a resposta acabou, ou falta chegar a próxima frase
-        if (streamAtivoRef.current) mudarEstado('thinking')
-        else if (estadoRef.current === 'speaking') mudarEstado('idle')
-      }
-      u.onstart = () => {
-        if (geracao !== geracaoRef.current) return
-        fadeOutMusica()
-        mudarEstado('speaking')
-      }
-      u.onboundary = () => (picoRef.current = 1)
-      u.onend = terminou
-      u.onerror = terminou
       pendentesRef.current++
       falouRef.current = true
-      synth.speak(u)
+      falaRef.current!.falar(frase, {
+        aoComecar: () => {
+          if (geracao !== geracaoRef.current) return
+          fadeOutMusica()
+          mudarEstado('speaking')
+        },
+        aoTerminar: () => {
+          if (geracao !== geracaoRef.current) return
+          if (--pendentesRef.current > 0) return
+          // fila vazia: ou a resposta acabou, ou falta chegar a próxima frase
+          if (streamAtivoRef.current) mudarEstado('thinking')
+          else if (estadoRef.current === 'speaking') mudarEstado('idle')
+        },
+        aoRecusar: () => {
+          if (geracao !== geracaoRef.current) return
+          pendentesRef.current = 0
+          if (estadoRef.current === 'speaking') mudarEstado('idle')
+        },
+      })
     },
     [fadeOutMusica, mudarEstado],
   )
@@ -247,7 +211,7 @@ export default function App() {
     geracaoRef.current++
     pendentesRef.current = 0
     bufferRef.current = ''
-    window.speechSynthesis?.cancel()
+    falaRef.current?.cancelar()
   }, [])
 
   // pré-aquece o processo do Claude (CLI + ClickUp) no servidor; é barato se já estiver vivo
@@ -446,10 +410,9 @@ export default function App() {
     }
   }, [alternarEscuta])
 
-  // voz escolhida uma vez; Claude aquecido ao abrir e sempre que a página volta ao foco
+  // Claude aquecido ao abrir e sempre que a página volta ao foco
   // (o servidor encerra o processo depois de 15 min parado)
   useEffect(() => {
-    if (window.speechSynthesis) void vozesProntas().then((v) => (vozRef.current = escolherVoz(v)))
     aquecer()
     const volta = () => {
       if (document.visibilityState === 'visible') aquecer()
@@ -511,7 +474,7 @@ export default function App() {
       audioRef.current = null
       recRef.current?.abort()
       pararMic()
-      window.speechSynthesis?.cancel()
+      falaRef.current?.cancelar()
     }
   }, [fadeOutMusica, pararMic, saudar])
 

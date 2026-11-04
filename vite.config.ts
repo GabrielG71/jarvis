@@ -1,7 +1,8 @@
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { aquecer, matarTodas, Ocupado, perguntar, UUID } from './server/claude-pool.ts'
+import { aquecer, matarTodas, perguntar, UUID } from './server/claude-pool.ts'
+import { sintetizar, TextoGrande, TextoInvalido, TtsFalhou, TtsOcupado } from './server/tts.ts'
 
 const MAX_BODY = 8 * 1024
 
@@ -75,6 +76,21 @@ function jarvisApi(): Plugin {
         }
       })
 
+      // fala com o Piper local: {text} -> audio/wav
+      server.middlewares.use('/api/tts', async (req, res) => {
+        if (req.method !== 'POST') return send(res, 405, { error: 'use POST' })
+        try {
+          const wav = await sintetizar(jsonBody(await readBody(req)).text)
+          res.statusCode = 200
+          res.setHeader('content-type', 'audio/wav')
+          res.setHeader('content-length', wav.length)
+          res.setHeader('cache-control', 'no-store')
+          res.end(wav)
+        } catch (e) {
+          erroJson(res, e)
+        }
+      })
+
       // resposta em NDJSON: {conversationId} no começo, {delta} conforme o texto chega, depois
       // {done, conversationId} — ou {error}
       server.middlewares.use('/api/chat', async (req, res) => {
@@ -122,7 +138,6 @@ function jarvisApi(): Plugin {
             )
             linha({ done: true, conversationId: id })
           } catch (e) {
-            if (e instanceof Ocupado && !res.headersSent) return send(res, 503, { error: e.message })
             linha({ error: e instanceof Error ? e.message : String(e) })
           }
           res.end()
@@ -137,8 +152,11 @@ function jarvisApi(): Plugin {
 function erroJson(res: ServerResponse, e: unknown) {
   if (e instanceof BodyGrande) return send(res, 413, { error: e.message })
   if (e instanceof SyntaxError) return send(res, 400, { error: 'JSON inválido' })
+  if (e instanceof TextoGrande) return send(res, 413, { error: e.message })
+  if (e instanceof TextoInvalido) return send(res, 400, { error: e.message })
+  if (e instanceof TtsFalhou) return send(res, 500, { error: e.message })
+  if (e instanceof TtsOcupado) return send(res, 503, { error: e.message })
   if (e instanceof Invalido) return send(res, 400, { error: e.message })
-  if (e instanceof Ocupado) return send(res, 503, { error: e.message })
   send(res, 500, { error: e instanceof Error ? e.message : String(e) })
 }
 

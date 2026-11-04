@@ -1,23 +1,42 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { dirname } from 'node:path'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { JARVIS_PROMPT } from './jarvis-prompt.ts'
 
-// Um processo `claude` long-lived por conversa: o custo de subir o CLI e conectar o MCP do
-// ClickUp é pago uma vez (no aquecimento), não a cada pergunta.
+// UMA conversa só, com um processo `claude` long-lived: o custo de subir o CLI e conectar o MCP
+// do ClickUp é pago uma vez (no aquecimento), não a cada pergunta. O id da sessão do claude fica
+// gravado em disco: se o processo for encerrado (ocioso) ou o servidor reiniciar, o próximo sobe
+// com --resume na MESMA sessão, então o Habblaud vê no máximo um agente (e nenhum com o processo
+// parado) em vez de uma sessão nova a cada abertura.
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
-const MAX_CONVERSAS = 3
-const OCIOSO_MS = 15 * 60_000
+const OCIOSO_MS = 5 * 60_000
 const TURNO_MS = 120_000
 const INTERRUPCAO_MS = 4_000
 const AQUECIMENTO = '[aquecimento] responda só: ok'
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-export class Ocupado extends Error {
-  constructor() {
-    super('o Jarvis está atendendo outras conversas, tente em instantes')
+// fora do repo e do git
+const ESTADO = join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'jarvis', 'claude-session')
+
+function lerSessao(): string | null {
+  try {
+    const v = readFileSync(ESTADO, 'utf8').trim()
+    return UUID.test(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
+function gravarSessao(id: string | null) {
+  try {
+    mkdirSync(dirname(ESTADO), { recursive: true })
+    writeFileSync(ESTADO, id ? id + '\n' : '', { mode: 0o600 })
+  } catch (e) {
+    console.error('jarvis: não gravou o estado da sessão:', e instanceof Error ? e.message : e)
   }
 }
 
@@ -35,14 +54,13 @@ interface Conversa {
   proc: ChildProcess | null
   claudeSession: string | null // para --resume se o processo morrer
   buf: string
+  recebeu: boolean // o processo atual já mandou algum evento
   fila: Promise<void> // turnos em série
   turno: Turno | null
   ocioso: NodeJS.Timeout | null
-  ultimoUso: number
-  virgem: boolean // aquecida e ainda sem pergunta
 }
 
-const conversas = new Map<string, Conversa>()
+let unica: Conversa | null = null
 
 function matar(p: ChildProcess | null) {
   if (!p || p.exitCode !== null || p.signalCode) return
@@ -50,21 +68,24 @@ function matar(p: ChildProcess | null) {
   setTimeout(() => p.kill('SIGKILL'), 2000).unref()
 }
 
+// Encerra só o processo: a conversa (e o id da sessão) fica, para o próximo uso retomar.
 function encerrar(c: Conversa) {
   if (c.ocioso) clearTimeout(c.ocioso)
   c.ocioso = null
-  conversas.delete(c.id)
-  matar(c.proc)
+  const p = c.proc
+  c.proc = null
+  c.buf = ''
+  matar(p)
 }
 
 export function matarTodas() {
-  for (const c of [...conversas.values()]) encerrar(c)
+  if (unica) encerrar(unica)
 }
 
 function renovar(c: Conversa) {
-  c.ultimoUso = Date.now()
   if (c.ocioso) clearTimeout(c.ocioso)
-  c.ocioso = setTimeout(() => encerrar(c), OCIOSO_MS)
+  // com turno em andamento não encerra: renova quando ele terminar
+  c.ocioso = setTimeout(() => (c.turno ? renovar(c) : encerrar(c)), OCIOSO_MS)
   c.ocioso.unref()
 }
 
@@ -78,7 +99,13 @@ function emitir(t: Turno, delta: string) {
 }
 
 function aoEvento(c: Conversa, j: any) {
-  if (typeof j.session_id === 'string' && UUID.test(j.session_id)) c.claudeSession = j.session_id
+  if (typeof j.session_id === 'string' && UUID.test(j.session_id)) {
+    c.recebeu = true
+    if (c.claudeSession !== j.session_id) {
+      c.claudeSession = j.session_id
+      gravarSessao(j.session_id)
+    }
+  }
   const t = c.turno
   if (!t) return
   if (j.type === 'stream_event' && !j.parent_tool_use_id) {
@@ -137,7 +164,9 @@ function subir(c: Conversa): ChildProcess {
     `${CAL}delete_event`,
     `${CAL}respond_to_event`,
   ]
-  if (c.claudeSession) args.push('--resume', c.claudeSession)
+  const retomando = c.claudeSession
+  if (retomando) args.push('--resume', retomando)
+  c.recebeu = false
 
   const p = spawn('claude', args, {
     cwd: ROOT,
@@ -166,6 +195,11 @@ function subir(c: Conversa): ChildProcess {
     if (c.proc !== p) return
     c.proc = null
     c.buf = ''
+    // morreu sem dizer nada ao retomar: a sessão gravada sumiu ou não abre mais — recomeça uma nova
+    if (retomando && !c.recebeu && c.claudeSession === retomando) {
+      c.claudeSession = null
+      gravarSessao(null)
+    }
     const t = c.turno
     if (!t) return
     clearTimeout(t.timer)
@@ -230,43 +264,30 @@ function rodarTurno(c: Conversa, mensagem: string, texto: ((d: string) => void) 
   })
 }
 
-function nova(): Conversa {
-  if (conversas.size >= MAX_CONVERSAS) {
-    // libera a ociosa mais antiga; se todas estiverem atendendo, recusa
-    const livres = [...conversas.values()].filter((x) => !x.turno).sort((a, b) => a.ultimoUso - b.ultimoUso)
-    if (!livres.length) throw new Ocupado()
-    encerrar(livres[0])
+// A conversa única: o id que o navegador manda (ou não) é ignorado — abas, app instalado e
+// reinícios do servidor caem todos na mesma sessão.
+function obter(): Conversa {
+  if (!unica) {
+    unica = {
+      id: randomUUID(),
+      proc: null,
+      claudeSession: lerSessao(),
+      buf: '',
+      recebeu: false,
+      fila: Promise.resolve(),
+      turno: null,
+      ocioso: null,
+    }
   }
-  const c: Conversa = {
-    id: randomUUID(),
-    proc: null,
-    claudeSession: null,
-    buf: '',
-    fila: Promise.resolve(),
-    turno: null,
-    ocioso: null,
-    ultimoUso: Date.now(),
-    virgem: false,
-  }
-  conversas.set(c.id, c)
-  renovar(c)
-  return c
+  renovar(unica)
+  return unica
 }
 
-// id desconhecido (servidor reiniciado, conversa ociosa já encerrada): reaproveita a conversa
-// aquecida e ainda sem uso, ou cria outra. Vários abas/chamadas de aquecimento dividem uma só.
-function obter(id?: string): Conversa {
-  const c = (id && conversas.get(id)) || [...conversas.values()].find((x) => x.virgem) || nova()
-  renovar(c)
-  return c
-}
-
-// Aquece: sobe o processo e manda uma mensagem boba para o MCP já estar conectado quando a
+// Aquece: sobe o processo (retomando a sessão gravada) e manda uma mensagem boba para o MCP já estar conectado quando a
 // primeira pergunta chegar. Devolve o id efetivo da conversa.
-export function aquecer(id?: string): string {
-  const c = obter(id)
+export function aquecer(_id?: string): string {
+  const c = obter()
   if (!c.proc && !c.turno) {
-    c.virgem = c.virgem || !c.claudeSession
     c.fila = c.fila.then(() => (c.proc ? undefined : rodarTurno(c, AQUECIMENTO, null))).catch(() => {})
   }
   return c.id
@@ -275,14 +296,13 @@ export function aquecer(id?: string): string {
 // Responde a uma pergunta; o texto chega aos poucos em `texto`. `aoIniciar` recebe o id
 // efetivo da conversa antes do primeiro texto.
 export function perguntar(
-  id: string | undefined,
+  _id: string | undefined,
   mensagem: string,
   texto: (delta: string) => void,
   aoIniciar: (id: string) => void,
   sinal: AbortSignal,
 ): Promise<void> {
-  const c = obter(id)
-  c.virgem = false
+  const c = obter()
   aoIniciar(c.id)
   const r = c.fila.then(() => {
     renovar(c)
