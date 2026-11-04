@@ -105,8 +105,11 @@ function aoEvento(c: Conversa, j: any) {
   }
 }
 
+const CAL = 'mcp__claude_ai_Google_Calendar__'
+
 function subir(c: Conversa): ChildProcess {
-  // sem shell: array de args. Só ferramentas do ClickUp liberadas (e sem as de apagar);
+  // sem shell: array de args. Só ferramentas do ClickUp (sem as de apagar) e do Google Calendar
+  // (só ler + criar, por nome; update/delete/respond bloqueados);
   // `--tools ""` tira Bash/Edit/Write do contexto. Com ENABLE_TOOL_SEARCH=false as ferramentas do
   // MCP já entram no prompt, sem a ida extra ao ToolSearch.
   const args = [
@@ -120,10 +123,19 @@ function subir(c: Conversa): ChildProcess {
     '--tools', '',
     '--disable-slash-commands',
     '--allowedTools', 'mcp__clickup__*',
+    `${CAL}list_calendars`,
+    `${CAL}list_events`,
+    `${CAL}get_event`,
+    `${CAL}search_events`,
+    `${CAL}suggest_time`,
+    `${CAL}create_event`,
     '--disallowedTools',
     'mcp__clickup__clickup_delete_task',
     'mcp__clickup__clickup_delete_comment',
     'mcp__clickup__clickup_delete_chat_message',
+    `${CAL}update_event`,
+    `${CAL}delete_event`,
+    `${CAL}respond_to_event`,
   ]
   if (c.claudeSession) args.push('--resume', c.claudeSession)
 
